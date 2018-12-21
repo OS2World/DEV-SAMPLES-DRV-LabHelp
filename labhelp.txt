@@ -1,0 +1,53 @@
+From: tommy@msc.cornell.edu
+Newsgroups: comp.os.os2.programmer.misc
+Organization: Cornell-Materials-Science-Center
+Reply-To: tommy@msc.cornell.edu
+
+From article <kendelm.740105369@argon>, by kendelm@argon.gas.uug.arizona.edu (kendel m mccarley):
+> 
+> I'm working at porting an application to be native os/2.  I'm 
+> new to this operating system and have gotten rather frustrated
+> at trying to figure out how to access physical memory.  I need
+> to read and write data from a memory and io mapped plug in board
+> that sits in user defined memory space and 300H in the io space.
+> The board takes up 16k of memory mapping.
+> 
+> I've tried IBM's documentation for device drivers, but haven't
+> found much in the way of answers.  Can anybody please point me
+> in the right direction to figure out how to do what was so easy
+> in DOS?
+
+I wrote a device driver to give C programs unlimited access to physical
+memory.  It is a series of routines in a driver appropriately  called
+labhelp (since it helps me do things in the lab that would normally be
+considered VERY ILLEGAL).  
+
+The driver works by opening a special device, asking for a physical
+memory address and it's length, and it returns a pointer appropriate
+for use directly from C.  The full source code is listed if you want
+to modify or incorporate into your programs.  I can't remember if I've
+but you can get it from my machine as detailed below.
+
+A second package (which is on hobbes), handles I/O port access.  It is
+fine for a low speed access (100 khZ max); you will want to modify the
+code if you are grabbing or sending digitized data at faster rates.
+
+I can't remember what's uploaded it to hobbes, but you can get it from
+my OS/2 machine.
+
+ftp: 128.84.249.11 (lore.msc.cornell.edu)
+login: anonymous  (no, ftp doesn't work on IBM TCP/IP package)
+binary
+get labhelp.zip
+get portio.zip
+
+> 
+> - Kendel
+-- 
+Michael O. Thompson            tommy@msc.cornell.edu
+Cornell University             (607) 255-4714
+
+OS/2:  For the few, the proud, the devoted!
+
+---
+ * Origin: The Black Cat's Usenet <=> Fidonet Gateway (1:109/401.0)

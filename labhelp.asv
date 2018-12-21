@@ -1,0 +1,507 @@
+;**********************************************************************
+;* MODULE NAME :  labhelp.asm             AUTHOR:  Michael Thompson   *
+;* DATE WRITTEN:  11-29-92                                            *
+;*                                                                    *
+;* DESCRIPTION:                                                       *
+;*                                                                    *
+;*  This device driver currently provides programs with direct access *
+;*  to OS/2 physical memory.  It is a complete violation of the OS/2  *
+;*  spirit of protected memory, but in lab situations, it is often    *
+;*  necessary to directly access board memory (i.e. D/A and A/D       *
+;*  converters).  This routine will probably be expanded to provide   *
+;*  low level system services for lab applications.                   *
+;*                                                                    *
+;* Access to physical memory is gained by passing a structure to the  *
+;* IOCTL code with category 0x81 and function 0x41,0x42 (just for fun).      *
+;* The parmameter block should contain three unsigned long values     *
+;*      0x00 Starting physical address requested                      *
+;*      0x04 Length of block desired (only low 16 bits significant)   *
+;*      0x08 empty pointer.  Filled with a _Seg16 pointer in users    *
+;*           LDT to the physical memory block                         *
+;* 
+;* Development of this code made possible by random code fragments    *
+;* purloined from numerous device drivers.  Thanks especially to all  *
+;* on IBM BBS and the comp.os.os2.programmer netnews for ideas.       *
+;**********************************************************************
+.286P
+
+        page    60,132
+        title   _DD   Lab Control/Help Device Driver
+
+        INCLUDE  devhlp.inc             ; DEFINITION OF DEVICE HELP CALLS
+
+;*********************************************************************
+;*----------------------------- EQUATES -----------------------------*
+;*********************************************************************
+
+RP_StatusError          equ     80h     ; RP_Status error bit
+RP_StatusDone           equ     01h     ; RP_Status done bit
+cr                      equ     0dh     ; ASCII code for carraige return
+lf                      equ     0ah     ; ASCII code for line feed
+stdout                  equ     1       ; File handle for standard output
+
+;**********************************************************************
+;*------------------------------ MACROS ------------------------------*
+;**********************************************************************
+
+Read8253IntoCx  MACRO                      ; Put 8253 counter 0 value in cx
+
+
+ENDM
+
+;**********************************************************************
+;*---------------------------- STRUCTURES ----------------------------*
+;**********************************************************************
+RequestPacket           struc           ; Request Packet header
+  RP_Length		db	?	; Request Packet length
+  RP_Unit		db	?	; unit CSEG (Block devices only)
+  RP_Command		db	?       ; Command CSEG
+  RP_ErrorCode		db	?       ; Command Error Code
+  RP_Status		db	?       ; Command Status Code
+  RP_Rsvd		dd	?       ; Reserved for DOS
+  RP_Q_Link		dd	?       ; Queue Linkage - not used here
+RequestPacket		ends
+
+RequestPktInit		struc		; Initialization Request Packet
+			db 13 dup(?)	; Common header information
+  RPI_NumberUnits	db	?	; number of units (not used)
+  RPI_CodeSegLen	dw      ?       ;     Code segment length (output)
+  RPI_DataSegLen	dw      ?       ;     Data segment length (output)
+  RPI_CommandLine	dd	?	; Pointer to command line
+  RPI_Drive		db	?	; Block devices only
+RequestPktInit		ends
+
+RequestPktIOCtl		struc		; Generic IOCtl request packet
+			db	13 dup(?)
+  RPC_categ		db	?	; category CSEG
+  RPC_funct		db	?	; function CSEG
+  RPC_parm		dd	?	; addr of parms (offset and selector)
+  RPC_buff		dd	?	; addr of buffer (offset and selector)
+RequestPktIOCtl		ends
+
+;**********************************************************************
+;*----------------------------- EXTERNS ------------------------------*
+;**********************************************************************
+
+        extrn  DosWrite:far
+
+;**********************************************************************
+;*-------------------------- DATA SEGMENT ----------------------------*
+;**********************************************************************
+
+DGROUP          group   _DATA
+
+_DATA		SEGMENT word public  'DATA'
+
+;*---------------------- Device Driver Header ------------------------*
+MemoryHeader		label	byte		; Device Driver header
+  NextDeviceDriver	dd	-1		; Last driver in chain
+  DeviceAttribute	dw	8880h		; Char,Open/Close,OS/2 1.1
+  StrategyOffset	dw	Strategy	; Offset of Strategy Routine
+			dw	-1		; IDC - not used here
+  DeviceName		db	'LABHELP$'	; Driver Device-Name
+			db	8 dup(0)	; Reserved
+
+;*-------------- List of strategy entry addresses --------------------*
+CmdList		label word
+		dw      Initialize	;  0 = Initialize driver
+                dw      Error		;  1 = Media Check
+                dw      Error		;  2 = Build BPB
+                dw      Error		;  3 = Not used
+		dw	Unsupported	;  4 = Read from device
+                dw      Unsupported	;  5 = Non-destructive read
+                dw      Unsupported	;  6 = Return input status
+                dw      Unsupported	;  7 = Flush input buffers
+                dw      Unsupported	;  8 = Write to device
+                dw      Unsupported	;  9 = Write with verify
+                dw      Unsupported	; 10 = Return output status
+                dw      Unsupported	; 11 = Flush output buffers
+                dw      Error		; 12 = Not used
+                dw      Open		; 13 = Device open
+                dw      Close		; 14 = Device close
+		dw	Error		; 15 = Remove media
+		dw	IOCtl		; 16 = Generic ioctl
+MaxCmd		equ	( $ - CmdList ) / TYPE CmdList
+
+;*------------ Data areas used by Strategy and Interrupt -------------*
+  DevHlpPtr		dd	?		; Pointer to Device Helper
+  UserCount		dw	0		; Number of active users
+  HaveTimer		dw	0		; 0==>can access timer
+  Last8253		dw	?		; 8253 ticks at last interrupt
+
+; TimeTicks must match parms structure in IOCTL call
+  TimerTicksStruct	dd	840		; ns/tick
+  TimerTicks		dd	0		; Number of timer ticks
+			dd	0		; 64 bit integer
+
+DSEG_END	label	byte			; last byte of device driver
+
+;*------------ Data areas used by Initialization only ----------------*
+BytesWritten	dw	?		; Used for DosWrite calls
+CopyRightMsg    db      cr, lf
+                db      'Lab Control Device Driver (LABHELP$) - Version 1.0', cr, lf
+		db	'  Providing unsafe accsex to OS/2 memory and system utilities', cr, lf
+                db      '  Courtesy of Michael Thompson, CGS, Ltd. (1992)', cr, lf, lf
+CopyRightMsgLen equ     $ - CopyRightMsg
+
+_DATA		ends
+
+i8253CountRegister      equ     40h     ; 8253 Counter Register
+i8253CtrlByteRegister   equ     43h     ; 8253 Control Byte Register
+i8253CmdReadCtrZero     equ     0       ; Latch Command
+i8253CmdInitCtrZero     equ     34h     ; LSB first, MSB second, Rate generator
+
+NanosInATick            equ     840     ; Number of nanoseconds in 1 8253 tick
+MillionDividedBy64      equ     15625   ; 1,000,000 divided by 64
+
+;**********************************************************************
+;*-------------------------- CODE SEGMENT ----------------------------*
+;**********************************************************************
+
+_TEXT		SEGMENT word public  'CODE'
+
+		assume  cs:_TEXT, ds:DGROUP
+
+;*---------------------------- Strategy ------------------------------*
+;*  STRATEGY ENTRY POINT.                                             *
+;*                                                                    *
+;*  INPUT: ES:BX = address of request packet                          *
+;*                                                                    *
+;*  OUTPUT: nothing                                                   *
+;*--------------------------------------------------------------------*
+Strategy	PROC	far
+		assume  cs:_TEXT,ds:DGROUP,es:nothing
+
+;	INT     3
+
+	mov	es:[bx].RP_Errorcode, 0			; clear error code
+	mov	es:[bx].RP_Status, RP_StatusDone	; clear status also
+
+	mov	al,es:[bx].RP_Command	; route control based on command CSEG
+	cmp	al, MaxCmd		; Command within jump table?
+	jbe	valid
+	 call	Error
+	 ret
+
+valid:	cbw				; Convert to word
+	mov	si,ax			; Move into register
+	shl	si,1			; multiply by 2 so it is a word offset
+	call	CmdList[si]		; Call command routine
+	ret
+
+Strategy        ENDP
+
+;*---------------------------- Unsupported ---------------------------*
+;*  Handle a required but unsupported request                         *
+;*                                                                    *
+;*  Input: ES:BX = address of request packet                          *
+;*                                                                    *
+;*  OUTPUT: status byte set                                           *
+;*--------------------------------------------------------------------*
+Unsupported	PROC	near	
+		assume  cs:_TEXT,ds:DGROUP,es:nothing
+
+        or	es:[bx].RP_Status, RP_StatusDone	; Indicate DONE
+        ret
+
+Unsupported	ENDP
+
+;*------------------------------ Open --------------------------------*
+;*  Handle an open request.                                           *
+;*                                                                    *
+;*  Input: ES:BX = address of request packet                          *
+;*                                                                    *
+;*  Output: status byte set                                           *
+;*--------------------------------------------------------------------*
+Open            PROC    near
+		assume  cs:_TEXT,ds:DGROUP,es:nothing
+
+        inc     [UserCount]				; Add another user
+        or	es:[bx].RP_Status, RP_StatusDone	; Indicate DONE
+        ret
+
+Open            ENDP
+
+;*------------------------------ Close -------------------------------*
+;*  Handle a close request.                                           *
+;*                                                                    *
+;*  Input: ES:BX = address of request packet                          *
+;*                                                                    *
+;*  Output: status byte set                                           *
+;*--------------------------------------------------------------------*
+Close           PROC    near
+		assume  cs:_TEXT,ds:DGROUP,es:nothing
+
+	cmp     UserCount, 0		; If no users, don't do anything
+        jz      NoUsers
+	 dec     [UserCount]		; Decrement number of users
+NoUsers:
+        or	es:[bx].RP_Status, RP_StatusDone  ; Indicate DONE
+        ret
+
+Close           ENDP
+
+;*------------------------------ IOCtl -------------------------------*
+;*  Handle a generic IOCtl request.                                   *
+;*                                                                    *
+;*  Input: ES:BX = address of request packet                          *
+;*                                                                    *
+;*  Output: status byte set                                           *
+;*                                                                    *
+;* Currently implemented via category 0x81 only			      *
+;*    Function: 0x41h - return _SEG16 pointer to physical memory      *
+;*    Function: 0x42h - return timer structure                        *
+;*--------------------------------------------------------------------*
+IOCtl		PROC	near
+		assume  cs:_TEXT,ds:DGROUP,es:nothing
+
+	cmp	es:[bx].RPC_categ, 81h		; Is it mine?
+	jz	lp0				; Start checking if okay
+notme:	 or	es:[bx].RP_Status, RP_StatusError + RP_StatusDone
+	 mov	es:[bx].RP_ErrorCode, 13h
+	 ret
+
+lp0:	cmp	es:[bx].RPC_funct, 41h		; Request for memory access?
+	jnz	lp1
+	 call	GetPhyMem
+	 ret
+lp1:	cmp	es:[bx].RPC_funct, 42h		; Request for time information?
+	jnz	lp2
+	 call	GetLocalTime
+	 ret
+lp2:	jmp	notme
+
+IOCtl		ENDP
+
+;*--------------------------- GetPhyMem ------------------------------*
+;*  Handle request for access to physical memory                      *
+;*                                                                    *
+;*  Input: ES:BX = address of request packet                          *
+;*                                                                    *
+;*  Output: status byte set                                           *
+;*--------------------------------------------------------------------*
+GetPhyMem	PROC	near
+		assume  cs:_TEXT,ds:DGROUP,es:nothing
+
+	push	bx			; Save these so can recover later
+	push	es
+;
+	push	ds
+	assume	ds:nothing
+	lds	si,es:[bx].RPC_parm
+	mov	bx,ds:[si]		; Get low order address
+	mov	ax,ds:[si+2]		; Get high order address
+	mov	cx,ds:[si+4]		; Get length of access desired
+	mov	dh,1			; Make segment R/W
+	pop	ds
+	assume	ds:DGROUP
+;
+	mov	dl,DevHlp_PhysToUVirt	; Convert physical to user LDT
+	call	[DevHlpPtr]		; Get segment, etc.
+	mov	ax,es			; Change LDT from ES:BX to
+	mov	cx,bx			; LDT access via AX:CX now
+;
+	pop	es			; Restore header address
+	pop	bx
+
+	push	ds			; Save DS since will trash
+	lds	si,es:[bx].RPC_parm	; Address of the parms
+	assume	ds:nothing
+	mov	ds:[si+8], cx		; Save offset of LDT selector
+	mov	ds:[si+10], ax		; Save segment of LDT selector
+	pop	ds			; Restore DS again
+	assume	ds:DGROUP
+;
+        or	es:[bx].RP_Status, RP_StatusDone  ; Indicate DONE
+        ret
+
+GetPhyMem	ENDP
+
+;*--------------------------- GetLocalTime ---------------------------*
+;*  Handle request for timer information                              *
+;*                                                                    *
+;*  Input: ES:BX = address of request packet                          *
+;*                                                                    *
+;*  Output: status byte set                                           *
+;*--------------------------------------------------------------------*
+GetLocalTime	PROC	near
+		assume  cs:_TEXT,ds:DGROUP,es:nothing
+
+	cmp	[HaveTimer],00		; If not zero, no timer access
+	jz	OkayTimer
+	 mov     es:[bx].RP_ErrorCode, 3	; OS/2 Unknown Command RC
+	 or      es:[bx].RP_Status, RP_StatusError + RP_StatusDone
+         ret
+
+OkayTimer:
+	push	es
+	 les	di,es:[bx].RPC_parm	; Minimize time interrupts off
+	 mov	si,offset TimerTicksStruct
+	 movsw				; Move 2 words for ns/tick first
+	 movsw
+	 cli
+	 call    UpdateTimeStamp	; Update running time stamp
+	 movsw				; Move 4 words (quicker than CX)
+	 movsw
+	 movsw
+	 movsw
+	 sti				; Absolute minimum possible
+	pop	es			; Restore header address
+
+        or	es:[bx].RP_Status, RP_StatusDone  ; Indicate DONE
+        ret
+
+GetLocalTime	ENDP
+
+;*------------------------------ Error -------------------------------*
+;*  Handle an request I should never receive.                         *
+;*                                                                    *
+;*  INPUT: ES:BX = address of request packet                          *
+;*                                                                    *
+;*  OUTPUT: status byte set                                           *
+;*--------------------------------------------------------------------*
+Error           PROC    near
+
+        mov     es:[bx].RP_ErrorCode, 3		; OS/2 Unknown Command RC
+						; Indicate DONE and ERROR
+        or      es:[bx].RP_Status, RP_StatusError + RP_StatusDone
+        ret
+
+Error           ENDP
+
+;*---------------------------- Interrupt -----------------------------*
+;*  DEVICE DRIVER TIME-INTERRUPT ROUTINE. CALLED ON EACH OS/2 CLOCK   *
+;*  TICK (MC146818 CHIP) VIA THE SetTimer DevHlp.                     *
+;*                                                                    *
+;*  OUTPUT: Updated time stamp                                        *
+;*--------------------------------------------------------------------*
+Interrupt       PROC    far
+
+        pushf                           ; Save registers
+	call	UpdateTimeStamp		; Does interrupts itself
+	popf
+        ret
+
+Interrupt       ENDP
+
+;*------------------------- UpdateTimeStamp --------------------------*
+;*  Update the running timestamp.  Routine goes off to 8253 and gets  *
+;*  the current timer count, and adds delta to its running total. The *
+;*  dword TimerTicks contains a cummulative sum of timer ticks since  *
+;*  the start of the whole shooting shebang.                          *
+;*                                                                    *
+;*  INPUT: nothing                                                    *
+;*                                                                    *
+;*  OUTPUT: Updates [TimerTicks], [Last8253]                          *
+;*                                                                    *
+;*  NOTE: The 8253 counter counts from 65536 to zero                  *
+;*                                                                    *
+;*  Registers: <none>                                                 *
+;*--------------------------------------------------------------------*
+UpdateTimeStamp PROC    near
+
+        push    ax			; Limit use to only AX and CX
+        push    cx
+
+        ;*******************************************************************
+        ;* Number of ticks since the last timestamp update:                *
+        ;*                                                                 *
+        ;*     if( Last8253 >= cx )                                        *
+        ;*         Delta = (Last8253 - cx) * NanosIn1Tick                  *
+        ;*     else                                                        *
+        ;*         NanosecsDelta = (0xFFFF - cx + Last8253)                *
+        ;*                                                                 *
+        ;* where cx is the current 8253 tick count                         *
+        ;*******************************************************************
+
+	mov     al,i8253CmdReadCtrZero	; Request Counter Latch
+	out     i8253CtrlByteRegister,al
+	in      al,i8253CountRegister	; Get LSB and save it
+	mov     cl,al
+	in      al,i8253CountRegister	; Get MSB and save it
+	mov     ch,al
+
+	mov     ax, [Last8253]		; Get prior tick count
+	cmp     ax, cx			; If it has wrapped (i.e. gone to zero
+	jae     NoWrap			;   and started again from 65536):
+Wrap:	 sub	ax,cx			; Fast way for handling wrap
+	 dec	ax			; ax+0x1000-cx
+	 jmp	short Update
+NoWrap:	sub	ax,cx			; Difference since last timer tick
+
+Update:	mov	[Last8253], cx		; Save tick count for next interrupt
+	xor	cx,cx			; Clear so can add later
+	add	word ptr [TimerTicks], ax
+	adc	word ptr [TimerTicks+2], cx
+	adc	word ptr [TimerTicks+4], cx
+	adc	word ptr [TimerTicks+6], cx
+
+        pop     cx
+        pop     ax
+	ret
+
+UpdateTimeStamp ENDP
+
+;*---------------------------- Initialize ----------------------------*
+;*  Device driver intialization routine (discarded by OS2 after use)  *
+;*                                                                    *
+;*  INPUT: ES:BX = address of init packet                             *
+;*                                                                    *
+;*  Actions: (1) save devhlp address                                  *
+;*           (2) output successful load message                       *
+;*           (3) return appropriate end of segment informatino        *
+;*                                                                    *
+;*  OUTPUT: nothing                                                   *
+;*                                                                    *
+;*--------------------------------------------------------------------*
+CSEG_END	label	byte			; last byte of device driver
+
+Initialize      PROC    near
+	        assume  cs:_TEXT,ds:DGROUP
+
+        mov     ax, word ptr es:[bx].RPI_CodeSegLen	; Save pointer to 
+        mov     word ptr [DevHlpPtr], ax		; Device Helper routine
+        mov     ax, word ptr es:[bx].RPI_DataSegLen
+        mov     word ptr [DevHlpPtr+2],ax
+
+	mov	es:[bx].RPI_CodeSegLen, offset CSEG_END	; End of code seg
+	mov	es:[bx].RPI_DataSegLen, offset DSEG_END	; End of data seg
+	or	es:[bx].RP_Status, RP_StatusDone	; Indicate DONE
+
+; Do initial sign-on message.  Init is done at ring three, and some of the
+; API's can be safely called from here
+	push	es
+	push	bx
+	.386P
+        push    stdout                          ; Write copyright info
+        push    ds
+        push    offset ds:CopyRightMsg
+        push    CopyRightMsgLen
+        push    ds
+        push    offset BytesWritten
+        call    DosWrite
+	.286P
+	pop	bx
+	pop	es
+
+; Initialize the timer/counter for my usage
+	cli                                     ; Disable interrupts
+	mov     al, i8253CmdInitCtrZero         ; Set 8253 counter 0 to mode 2
+	out     i8253CtrlByteRegister, al       ;     ( Rate generator )
+	xor     ax, ax                          ; Init Count Register to zero
+	out     i8253CountRegister, al          ;   by writing 0 to LSB
+	out     i8253CountRegister, al          ;   and MSB
+	sti                                     ; Enable interrupts
+
+	mov	ax, offset Interrupt		; Our timer hook address
+	mov	dl, DevHlp_SetTimer		; SetTimer function
+	call	[DevHlpPtr]			; Call Device Helper routine
+	jnc	NoErr
+	 mov	[HaveTimer], 0FFh;		; Remember we have no timer 
+NoErr:	ret
+
+Initialize      ENDP
+
+_TEXT		ENDS
+
+END
